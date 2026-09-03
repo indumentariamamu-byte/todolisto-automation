@@ -1,4 +1,5 @@
 const fs = require('fs');
+const path = require('path');
 const { parseCsv, writeCsv } = require('./urutienda-batch');
 
 function normalizeName(value = '') {
@@ -49,7 +50,12 @@ function countBy(items, keyFn) {
   return counts;
 }
 
-function buildMatchReport({ sheetCsv, urutiendaCsv, reportCsv, priceChangesCsv }) {
+function ensureParent(file) {
+  const dir = path.dirname(path.resolve(file));
+  fs.mkdirSync(dir, { recursive: true });
+}
+
+function buildMatchReport({ sheetCsv, urutiendaCsv, reportCsv, priceChangesCsv, safePriceChangesCsv, maxAutoPercent = 10 }) {
   const sheetRows = parseCsv(fs.readFileSync(sheetCsv, 'utf8'));
   const uruRows = parseCsv(fs.readFileSync(urutiendaCsv, 'utf8'));
   if (sheetRows.length < 2 || uruRows.length < 2) throw new Error('Alguno de los CSV está vacío.');
@@ -88,37 +94,61 @@ function buildMatchReport({ sheetCsv, urutiendaCsv, reportCsv, priceChangesCsv }
     uruByNorm.get(item.norm).push(item);
   }
 
-  const reportHeaders = [
+  const report = [[
     'Fila Sheet','Codigo','NOMBRE Sheet','PRECIO WEB AUTO','Producto ID','Producto UruTienda',
-    'Precio UruTienda','Estado','Diferencia precio'
-  ];
-  const report = [reportHeaders];
+    'Precio UruTienda','Estado','Diferencia precio','Diferencia %','Auto permitido'
+  ]];
   const priceChanges = [['Producto ID','Precio producto']];
-  const summary = { sheetNamed: sheetItems.length, uruProducts: uruItems.length, exactUnique: 0, priceDiff: 0, samePrice: 0, invalidPrice: 0, ambiguous: 0, noMatch: 0 };
+  const safePriceChanges = [['Producto ID','Precio producto']];
+  const summary = {
+    sheetNamed: sheetItems.length,
+    uruProducts: uruItems.length,
+    exactUnique: 0,
+    priceDiff: 0,
+    safePriceDiff: 0,
+    samePrice: 0,
+    invalidPrice: 0,
+    ambiguous: 0,
+    noMatch: 0,
+    maxAutoPercent
+  };
 
   for (const s of sheetItems) {
     const candidates = uruByNorm.get(s.norm) || [];
     let status = 'SIN_COINCIDENCIA';
     let u = null;
     let diff = '';
+    let pct = '';
+    let autoAllowed = 'NO';
 
     if (candidates.length === 1 && sheetCounts.get(s.norm) === 1 && uruCounts.get(s.norm) === 1) {
       u = candidates[0];
       summary.exactUnique++;
       const sp = parseSheetPrice(s.priceRaw);
       const up = parseUruPrice(u.priceRaw);
-      if (sp == null || up == null) {
+      if (sp == null || up == null || sp <= 0 || up <= 0) {
         status = 'COINCIDENCIA_SEGURA_PRECIO_INVALIDO';
         summary.invalidPrice++;
       } else if (Math.abs(sp - up) < 0.001) {
         status = 'COINCIDENCIA_SEGURA_SIN_CAMBIO';
         summary.samePrice++;
         diff = '0';
+        pct = '0';
       } else {
-        status = 'COINCIDENCIA_SEGURA_PRECIO_DISTINTO';
+        const difference = sp - up;
+        const percent = Math.abs(difference) / up * 100;
+        diff = String(difference);
+        pct = percent.toFixed(2);
         summary.priceDiff++;
-        diff = String(sp - up);
         priceChanges.push([u.id, sp.toFixed(2)]);
+        if (percent <= maxAutoPercent) {
+          status = 'COINCIDENCIA_SEGURA_PRECIO_DISTINTO_CONTROLADO';
+          autoAllowed = 'SI';
+          summary.safePriceDiff++;
+          safePriceChanges.push([u.id, sp.toFixed(2)]);
+        } else {
+          status = 'COINCIDENCIA_SEGURA_PRECIO_DISTINTO_REVISAR';
+        }
       }
     } else if (candidates.length > 0) {
       status = 'AMBIGUA_DUPLICADA';
@@ -129,22 +159,26 @@ function buildMatchReport({ sheetCsv, urutiendaCsv, reportCsv, priceChangesCsv }
 
     report.push([
       s.sheetRow, s.code, s.name, s.priceRaw,
-      u ? u.id : '', u ? u.name : '', u ? u.priceRaw : '', status, diff
+      u ? u.id : '', u ? u.name : '', u ? u.priceRaw : '', status, diff, pct, autoAllowed
     ]);
   }
 
+  ensureParent(reportCsv);
+  ensureParent(priceChangesCsv);
+  ensureParent(safePriceChangesCsv);
   fs.writeFileSync(reportCsv, writeCsv(report), 'utf8');
   fs.writeFileSync(priceChangesCsv, writeCsv(priceChanges), 'utf8');
-  return { ...summary, reportCsv, priceChangesCsv };
+  fs.writeFileSync(safePriceChangesCsv, writeCsv(safePriceChanges), 'utf8');
+  return { ...summary, reportCsv, priceChangesCsv, safePriceChangesCsv };
 }
 
 if (require.main === module) {
-  const [sheetCsv, urutiendaCsv, reportCsv = 'output/match-report.csv', priceChangesCsv = 'output/price-changes.csv'] = process.argv.slice(2);
+  const [sheetCsv, urutiendaCsv, reportCsv = 'output/match-report.csv', priceChangesCsv = 'output/price-changes.csv', safePriceChangesCsv = 'output/safe-price-changes.csv'] = process.argv.slice(2);
   if (!sheetCsv || !urutiendaCsv) {
-    console.error('Uso: node src/match-products.js <sheet.csv> <urutienda.csv> [reporte.csv] [cambios.csv]');
+    console.error('Uso: node src/match-products.js <sheet.csv> <urutienda.csv> [reporte.csv] [cambios.csv] [cambios-seguros.csv]');
     process.exit(1);
   }
-  const result = buildMatchReport({ sheetCsv, urutiendaCsv, reportCsv, priceChangesCsv });
+  const result = buildMatchReport({ sheetCsv, urutiendaCsv, reportCsv, priceChangesCsv, safePriceChangesCsv });
   console.log(JSON.stringify(result, null, 2));
 }
 
